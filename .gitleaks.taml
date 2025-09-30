@@ -1,0 +1,6 @@
+title = "Gitleaks configuration"
+# Add custom rules or allowlists here if needed
+# For example, to allow a specific dummy key:
+# [[allowlist.strings]]
+#   description = "Allow dummy AWS key"
+#   string = "AKIAEXAMPLEKEY"

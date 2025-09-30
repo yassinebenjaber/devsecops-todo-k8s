@@ -1,0 +1,36 @@
+# infra/VagrantfileVagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/focal64"
+  config.vm.hostname = "devsecops-box"
+  config.vm.network "forwarded_port", guest: 3000, host: 3000
+  config.vm.synced_folder ".", "/vagrant", type: "virtualbox"
+  config.vm.provider "virtualbox" do |vb|
+    vb.memory = 4096
+    vb.cpus = 2
+  end
+
+  config.vm.provision "shell", inline: <<-SHELL
+    apt-get update
+    apt-get install -y ca-certificates curl gnupg lsb-release apt-transport-https jq
+    # Docker
+    curl -fsSL https://get.docker.com | sh
+    usermod -aG docker vagrant
+
+    # kubectl
+    curl -LO "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
+    chmod +x kubectl && mv kubectl /usr/local/bin/
+
+    # kind (Kubernetes in Docker)
+    curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+    chmod +x kind && mv kind /usr/local/bin/
+
+    # install trivy, cosign, syft quickly (binaries)
+    curl -sL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | bash -s -- -b /usr/local/bin
+    curl -sSL https://github.com/anchore/syft/releases/latest/download/syft_linux_amd64 -o /usr/local/bin/syft && chmod +x /usr/local/bin/syft
+    curl -sSLO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && mv cosign-linux-amd64 /usr/local/bin/cosign && chmod +x /usr/local/bin/cosign
+
+    # gitleaks
+    curl -sL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks-linux-amd64 -o /usr/local/bin/gitleaks && chmod +x /usr/local/bin/gitleaks
+
+    # nmap
+    apt-get install -y nmap
+  SHELLend

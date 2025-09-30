@@ -1,0 +1,246 @@
+name: CI/CD DevSecOps Pipeline
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/devsecops-todo-k8s
+  IMAGE_TAG: ${{ github.sha }}
+
+permissions:
+  contents: read
+  packages: write   # Required to publish packages to GHCR
+  id-token: write   # Required for keyless signing with Cosign/Sigstore
+
+jobs:
+  # 1. PRE-COMMIT & SECRET SCANNING
+  security_checks:
+    name: "🛡️ Pre-Commit & Security"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout code"
+        uses: actions/checkout@v4
+        with: { fetch-depth: 0 } # Needed for gitleaks to scan history
+
+      - name: "Run pre-commit hooks"
+        uses: pre-commit/action@v3.0.1
+
+      - name: "Scan for secrets with Gitleaks"
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          report_format: sarif
+          report_path: gitleaks-report.sarif
+
+      - name: "Upload SARIF file"
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks-report.sarif
+
+  # 2. SCA & SAST
+  scan_and_test:
+    name: "📦 SCA, SAST & Unit Tests"
+    runs-on: ubuntu-latest
+    needs: security_checks
+    steps:
+      - name: "Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "Setup Node.js"
+        uses: actions/setup-node@v4
+        with: { node-version: '18' }
+
+      - name: "Install dependencies"
+        working-directory: ./app
+        run: npm ci
+
+      - name: "Run SAST scan with Semgrep"
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: "p/ci" # Default community ruleset
+
+      - name: "Run Unit Tests"
+        working-directory: ./app
+        run: npm test
+
+      - name: "Run SCA scan with Trivy"
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: './app'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'library'
+          severity: 'CRITICAL,HIGH'
+
+  # 3. BUILD, SIGN & PUSH IMAGE
+  build_and_push:
+    name: "🏗️ Build, Sign & Push"
+    runs-on: ubuntu-latest
+    needs: scan_and_test
+    steps:
+      - name: "Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "Set up Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      - name: "Login to GitHub Container Registry"
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "Build and push Docker image"
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }},${{ env.IMAGE_NAME }}:latest
+
+      - name: "Scan container image with Trivy"
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: "Install Cosign"
+        uses: sigstore/cosign-installer@v3.5.0
+
+      - name: "Sign the container image"
+        run: cosign sign --yes ${{ env.IMAGE_NAME }}@$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} | cut -d'@' -f2)
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+
+      - name: "Generate SBOM with Syft"
+        uses: anchore/syft-action@v0
+        with:
+          image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: "cyclonedx-json"
+          output-file: "sbom.json"
+
+      - name: "Upload SBOM as artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+
+  # 4. DEPLOY TO STAGING
+  deploy_staging:
+    name: "🚢 Deploy to Staging"
+    runs-on: ubuntu-latest
+    needs: build_and_push
+    environment: staging
+    steps:
+      - name: "Checkout code"
+        uses: actions/checkout@v4
+
+      - name: "Scan IaC files with Checkov"
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ./k8s
+          framework: kubernetes
+
+      - name: "Install kubectl"
+        uses: azure/setup-kubectl@v4
+
+      - name: "Configure kubeconfig for staging"
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 --decode > ~/.kube/config
+
+      - name: "Deploy to staging cluster"
+        run: |
+          kubectl set image deployment/todo-app todo-app=${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} -n staging
+          kubectl rollout status deployment/todo-app -n staging
+
+      - name: "Run Nmap port scan on service endpoint"
+        run: |
+          SERVICE_IP=$(kubectl get svc todo-service -n staging -o jsonpath='{.spec.clusterIP}')
+          echo "Scanning service at IP: $SERVICE_IP"
+          nmap -p- --open $SERVICE_IP
+
+  # 5. DYNAMIC & E2E TESTS
+  dynamic_tests:
+    name: "🔬 DAST & E2E Tests"
+    runs-on: ubuntu-latest
+    needs: deploy_staging
+    steps:
+      - name: "Run DAST scan with OWASP ZAP"
+        uses: zaproxy/action-baseline@v0.11.0
+        with:
+          target: ${{ secrets.STAGING_ENDPOINT }} # e.g., http://staging.todo-app.com
+          # fail_action: true # Uncomment to fail pipeline on ZAP alerts
+
+      - name: "Run E2E tests"
+        run: |
+          # Replace with actual Playwright/Cypress tests
+          curl -f ${{ secrets.STAGING_ENDPOINT }}/todos || exit 1
+          curl -f ${{ secrets.STAGING_ENDPOINT }}/healthz || exit 1
+
+  # 6. PROMOTE TO PRODUCTION
+  promote_production:
+    name: "✅ Promote to Production"
+    runs-on: ubuntu-latest
+    needs: dynamic_tests
+    # Only run on pushes to the main branch, not on PRs
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+      - name: "Install Cosign"
+        uses: sigstore/cosign-installer@v3.5.0
+
+      - name: "Verify image signature before promotion"
+        run: cosign verify --key "https://fulcio.sigstore.dev/api/v1/root" --certificate-identity "https://github.com/actions/workflow_dispatch@v1" --certificate-oidc-issuer "https://token.actions.githubusercontent.com" ${{ env.IMAGE_NAME }}@$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} | cut -d'@' -f2)
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+
+      - name: "Configure kubeconfig for production"
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 --decode > ~/.kube/config
+      
+      - name: "Deploy to production (canary)"
+        run: |
+          echo "Promoting image ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} to production."
+          kubectl set image deployment/todo-app todo-app=${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} -n production
+          kubectl rollout status deployment/todo-app -n production
+
+  # 7. NOTIFICATION
+  notify:
+    name: "🔔 Notify on Success"
+    runs-on: ubuntu-latest
+    needs: promote_production
+    if: success()
+    steps:
+      - name: "Send Slack notification"
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "✅ Successful deployment to production for `${{ github.repository }}`.",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "✅ Successful deployment to production for `${{ github.repository }}`."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": "*Commit:*\n`${{ github.sha }}`" },
+                    { "type": "mrkdwn", "text": "*Triggered by:*\n`${{ github.actor }}`" }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
