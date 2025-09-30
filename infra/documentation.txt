@@ -1,0 +1,8 @@
+Vagrant documentation: 
+docker --version
+kubectl version --client
+kind version
+trivy --version
+syft version
+cosign version
+nmap --version
